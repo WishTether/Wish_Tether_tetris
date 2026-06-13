@@ -335,6 +335,7 @@ h1 {
   <div class="controls-row">
     <button class="btn btn-primary" onclick="startGame()">&#x2726; New Game</button>
     <button class="btn btn-secondary" onclick="togglePause()">&#x23F8; Pause</button>
+    <button class="btn btn-secondary" id="mute-btn" onclick="toggleMute()">&#x1F50A; Sound</button>
   </div>
 
   <div class="mobile-controls">
@@ -418,6 +419,8 @@ function startGame() {
   cancelAnimationFrame(animFrame);
   startTime = Date.now();
   timerInterval = setInterval(tickTimer, 500);
+  stopBGM();
+  startBGM();
   gameLoop();
 }
 
@@ -472,6 +475,7 @@ function togglePause() {
 function move(dx,dy) {
   if (!collides(currentPiece.shape, currentPiece.x+dx, currentPiece.y+dy)) {
     currentPiece.x += dx; currentPiece.y += dy; drawBoard();
+    soundMove();
   }
 }
 
@@ -482,7 +486,7 @@ function rotate() {
   var kicks = [0,-1,1,-2,2];
   for (var i=0;i<kicks.length;i++) {
     if (!collides(rot, currentPiece.x+kicks[i], currentPiece.y)) {
-      currentPiece.shape = rot; currentPiece.x += kicks[i]; drawBoard(); return;
+      currentPiece.shape = rot; currentPiece.x += kicks[i]; drawBoard(); soundRotate(); return;
     }
   }
 }
@@ -491,6 +495,7 @@ function hardDrop() {
   while (!collides(currentPiece.shape, currentPiece.x, currentPiece.y+1)) {
     currentPiece.y++; score += 2;
   }
+  soundHardDrop();
   lock();
 }
 
@@ -520,6 +525,7 @@ function lock() {
       board[ny][currentPiece.x+c] = currentPiece.color;
     }
   }
+  soundLand();
   clearLines();
   currentPiece = nextPiece;
   nextPiece = randomPiece();
@@ -538,6 +544,7 @@ function clearLines() {
   if (cleared>0) {
     var pts=[0,100,300,500,800];
     score += (pts[cleared]||800)*level;
+    soundLineClear(cleared);
     lines += cleared;
     level = Math.floor(lines/10)+1;
     var box=document.getElementById('lines-box');
@@ -551,6 +558,8 @@ function endGame() {
   running=false;
   clearInterval(timerInterval);
   cancelAnimationFrame(animFrame);
+  stopBGM();
+  soundGameOver();
   if (score>bestScore) {
     bestScore=score;
     localStorage.setItem('wish_tetris_best',bestScore);
@@ -638,6 +647,230 @@ function drawNext() {
     drawCell(nextCtx,ox+c,oy+r,nextPiece.color,ns);
   }
 }
+
+
+// ─── AUDIO ENGINE ───────────────────────────────────────────────
+var AudioCtx = window.AudioContext || window.webkitAudioContext;
+var audioCtx = null;
+var bgmNodes = [];
+var bgmGain = null;
+var isMuted = false;
+var bgmStarted = false;
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new AudioCtx();
+  return audioCtx;
+}
+
+// SFX helper
+function sfx(type, freq, duration, vol, freqEnd) {
+  if (isMuted) return;
+  try {
+    var ac = getAudioCtx();
+    var osc = ac.createOscillator();
+    var gain = ac.createGain();
+    var comp = ac.createDynamicsCompressor();
+    osc.connect(gain); gain.connect(comp); comp.connect(ac.destination);
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ac.currentTime);
+    if (freqEnd) osc.frequency.exponentialRampToValueAtTime(freqEnd, ac.currentTime + duration);
+    gain.gain.setValueAtTime(vol, ac.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + duration);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + duration);
+  } catch(e) {}
+}
+
+function sfxChord(freqs, type, duration, vol) {
+  if (isMuted) return;
+  freqs.forEach(function(f) { sfx(type, f, duration, vol); });
+}
+
+// Sound effects — boosted volumes
+function soundMove()     { sfx('sine', 660, 0.07, 0.45, 590); }
+function soundRotate()   {
+  sfx('sine', 523, 0.05, 0.4);
+  sfx('sine', 784, 0.09, 0.35, 1047);
+}
+function soundLand()     {
+  sfx('triangle', 180, 0.05, 0.5);
+  sfx('sine',     90,  0.15, 0.55, 60);
+}
+function soundHardDrop() {
+  sfx('sawtooth', 440, 0.04, 0.45, 110);
+  sfx('sine',     220, 0.18, 0.5,  55);
+}
+function soundLineClear(count) {
+  var chordMap = {
+    1: [1047, 1319],
+    2: [1047, 1319, 1568],
+    3: [1047, 1319, 1568, 2093],
+    4: [1047, 1319, 1568, 2093, 2637]
+  };
+  sfxChord(chordMap[count] || chordMap[1], 'sine', 0.5, 0.5);
+}
+function soundGameOver() {
+  if (isMuted) return;
+  try {
+    var ac = getAudioCtx();
+    var notes = [523, 440, 370, 311, 220, 165];
+    notes.forEach(function(f, i) {
+      var osc = ac.createOscillator();
+      var g = ac.createGain();
+      osc.connect(g); g.connect(ac.destination);
+      osc.type = 'sawtooth';
+      osc.frequency.value = f;
+      var t = ac.currentTime + i * 0.2;
+      g.gain.setValueAtTime(0.55, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+      osc.start(t); osc.stop(t + 0.4);
+    });
+  } catch(e) {}
+}
+
+// ─── MAGICAL MYSTERY BGM ─────────────────────────────────────────
+// Hedwig's-style: celesta-like arpeggios + warm string pad + gentle bass
+// Scale: E minor pentatonic with major touches (E G A B D E)
+function startBGM() {
+  if (isMuted || bgmStarted) return;
+  bgmStarted = true;
+  try {
+    var ac = getAudioCtx();
+    bgmGain = ac.createGain();
+    bgmGain.gain.setValueAtTime(0.0, ac.currentTime);
+    bgmGain.gain.linearRampToValueAtTime(0.55, ac.currentTime + 2.5);
+    bgmGain.connect(ac.destination);
+
+    // ── Layer 1: Warm string pad (Em chord: E2 G2 B2)
+    [82.41, 98, 123.47].forEach(function(freq) {
+      var osc = ac.createOscillator();
+      var g = ac.createGain();
+      // Detune two oscs slightly for warmth
+      var osc2 = ac.createOscillator();
+      var g2 = ac.createGain();
+      osc.type = 'triangle'; osc.frequency.value = freq;
+      osc2.type = 'triangle'; osc2.frequency.value = freq * 1.005;
+      g.gain.value = 0.28; g2.gain.value = 0.28;
+      var lfo = ac.createOscillator();
+      var lg = ac.createGain();
+      lfo.frequency.value = 5; lg.gain.value = 0.8;
+      lfo.connect(lg); lg.connect(osc.frequency);
+      osc.connect(g); g.connect(bgmGain);
+      osc2.connect(g2); g2.connect(bgmGain);
+      lfo.start(); osc.start(); osc2.start();
+      bgmNodes.push(osc, osc2, lfo);
+    });
+
+    // ── Layer 2: Gentle bass pulse (E1 pedal, soft)
+    var bassOsc = ac.createOscillator();
+    var bassGain = ac.createGain();
+    bassOsc.type = 'sine'; bassOsc.frequency.value = 41.2;
+    bassGain.gain.value = 0.35;
+    bassOsc.connect(bassGain); bassGain.connect(bgmGain);
+    bassOsc.start();
+    bgmNodes.push(bassOsc);
+
+    // ── Layer 3: Celesta-like melody (Hedwig-inspired motif)
+    // E minor: E4=329.63, G4=392, A4=440, B4=493.88, D5=587.33, E5=659.26, G5=784, B5=987.77
+    var E4=329.63, G4=392, A4=440, B4=493.88, D5=587.33, E5=659.26, G5=784, B5=987.77, Fs5=739.99, C5=523.25;
+
+    // Hedwig-inspired melody phrase (8-bar loop, ~4s per bar at 80bpm = 3s per bar)
+    var bpm = 80;
+    var q = 60/bpm;       // quarter note
+    var e = q/2;          // eighth
+    var d = q*1.5;        // dotted quarter
+    var h = q*2;          // half
+
+    // phrase: [freq, dur, delay_from_start]
+    // Main motif (Hedwig-like, stays in E minor)
+    var phrase = [
+      // bar 1-2: main motif
+      [B4,  e,   0],
+      [E5,  d,   e],
+      [G5,  e,   e+d],
+      [Fs5, d,   e+d+e],
+      [E5,  h,   e+d+e+d],
+      // bar 3: descent
+      [B5,  e,   e+d+e+d+h],
+      [A4,  d,   e+d+e+d+h+e],
+      [C5,  e,   e+d+e+d+h+e+d],
+      [B4,  h,   e+d+e+d+h+e+d+e],
+      // bar 4: connecting phrase
+      [G4,  e,   e+d+e+d+h+e+d+e+h],
+      [Fs5, d,   e+d+e+d+h+e+d+e+h+e],
+      [E5,  d,   e+d+e+d+h+e+d+e+h+e+d],
+      [D5,  h,   e+d+e+d+h+e+d+e+h+e+d+d],
+      // bar 5-6: second phrase (higher)
+      [E5,  e,   e+d+e+d+h+e+d+e+h+e+d+d+h],
+      [A4,  d,   e+d+e+d+h+e+d+e+h+e+d+d+h+e],
+      [B4,  e,   e+d+e+d+h+e+d+e+h+e+d+d+h+e+d],
+      [G4,  d,   e+d+e+d+h+e+d+e+h+e+d+d+h+e+d+e],
+      [E4,  h,   e+d+e+d+h+e+d+e+h+e+d+d+h+e+d+e+d],
+    ];
+
+    var loopDur = phrase[phrase.length-1][2] + phrase[phrase.length-1][1] + h;
+
+    function scheduleCelesta(startT) {
+      phrase.forEach(function(note) {
+        var freq = note[0], dur = note[1], delay = note[2];
+        var t = startT + delay;
+        var osc = ac.createOscillator();
+        var g = ac.createGain();
+        // Celesta = sine + a touch of triangle, quick attack, medium decay
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.72, t + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.001, t + Math.min(dur * 1.1, dur + 0.3));
+        osc.connect(g); g.connect(bgmGain);
+        osc.start(t); osc.stop(t + dur + 0.35);
+        bgmNodes.push(osc);
+
+        // Harmonic shimmer (one octave up, quieter)
+        var osc2 = ac.createOscillator();
+        var g2 = ac.createGain();
+        osc2.type = 'triangle';
+        osc2.frequency.value = freq * 2;
+        g2.gain.setValueAtTime(0, t);
+        g2.gain.linearRampToValueAtTime(0.18, t + 0.015);
+        g2.gain.exponentialRampToValueAtTime(0.001, t + Math.min(dur * 0.8, 0.3));
+        osc2.connect(g2); g2.connect(bgmGain);
+        osc2.start(t); osc2.stop(t + dur + 0.2);
+        bgmNodes.push(osc2);
+      });
+
+      // Schedule next loop
+      var nextStart = startT + loopDur;
+      var delay = Math.max(0, (nextStart - ac.currentTime - 0.8) * 1000);
+      setTimeout(function() {
+        if (bgmStarted && !isMuted) scheduleCelesta(nextStart);
+      }, delay);
+    }
+
+    scheduleCelesta(ac.currentTime + 1.0);
+
+  } catch(e) { console.log('BGM error', e); }
+}
+
+function stopBGM() {
+  bgmStarted = false;
+  bgmNodes.forEach(function(n) { try { n.stop(); } catch(e) {} });
+  bgmNodes = [];
+  if (bgmGain) { bgmGain.disconnect(); bgmGain = null; }
+}
+
+function toggleMute() {
+  isMuted = !isMuted;
+  var btn = document.getElementById('mute-btn');
+  if (isMuted) {
+    stopBGM();
+    if (btn) btn.textContent = '\uD83D\uDD07 Mute';
+  } else {
+    if (btn) btn.textContent = '\uD83D\uDD0A Sound';
+    if (running && !bgmStarted) startBGM();
+  }
+}
+// ─────────────────────────────────────────────────────────────────
 
 window.addEventListener('DOMContentLoaded', init);
 </script>
